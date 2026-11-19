@@ -314,6 +314,16 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/")
+def root():
+    return {
+        "name": app.title,
+        "status": "ok",
+        "health": "/health",
+        "docs": "/docs",
+    }
+
+
 # ---------- HOME FEED (TMDB) ----------
 @app.get("/home", response_model=List[TMDBMovieCard])
 async def home(
