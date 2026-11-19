@@ -7,6 +7,8 @@ import pandas as pd
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -15,14 +17,10 @@ from dotenv import load_dotenv
 # ENV
 # =========================
 load_dotenv()
-TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
-
-if not TMDB_API_KEY:
-    # Don't crash import-time in production if you prefer; but for you better fail early:
-    raise RuntimeError("TMDB_API_KEY missing. Put it in .env as TMDB_API_KEY=xxxx")
 
 
 # =========================
@@ -32,7 +30,7 @@ app = FastAPI(title="Movie Recommender API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # for local streamlit
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -108,6 +106,12 @@ async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     - Network errors -> 502
     - TMDB API errors -> 502 with detail
     """
+    if not TMDB_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="TMDB_API_KEY is missing. Please set your TMDB_API_KEY in environment variables or .env file.",
+        )
+
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
 
@@ -161,7 +165,7 @@ async def tmdb_movie_details(movie_id: int) -> TMDBMovieDetails:
 async def tmdb_search_movies(query: str, page: int = 1) -> Dict[str, Any]:
     """
     Raw TMDB response for keyword search (MULTIPLE results).
-    Streamlit will use this for suggestions and grid.
+    Used by frontend for suggestions and grid.
     """
     return await tmdb_get(
         "/search/movie",
@@ -183,36 +187,51 @@ async def tmdb_search_first(query: str) -> Optional[dict]:
 # =========================
 # TF-IDF Helpers
 # =========================
+def ensure_pickles_loaded() -> bool:
+    global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
+    if df is not None and TITLE_TO_IDX is not None and tfidf_matrix is not None:
+        return True
+    try:
+        load_pickles()
+        return True
+    except Exception as e:
+        print(f"Warning: Pickle files could not be loaded: {e}")
+        return False
+
+
 def build_title_to_idx_map(indices: Any) -> Dict[str, int]:
     """
-    indices.pkl can be:
-    - dict(title -> index)
-    - pandas Series (index=title, value=index)
-    We normalize into TITLE_TO_IDX.
+    Normalizes indices into title -> int index map.
+    Safe against pandas Series, duplicate indices, and unexpected types.
     """
     title_to_idx: Dict[str, int] = {}
-
-    if isinstance(indices, dict):
-        for k, v in indices.items():
-            title_to_idx[_norm_title(k)] = int(v)
+    if indices is None:
         return title_to_idx
 
-    # pandas Series or similar mapping
     try:
-        for k, v in indices.items():
-            title_to_idx[_norm_title(k)] = int(v)
+        items = indices.items() if hasattr(indices, "items") else []
+        for k, v in items:
+            try:
+                if hasattr(v, "iloc"):
+                    v = v.iloc[0]
+                norm_k = _norm_title(str(k))
+                if norm_k and norm_k not in title_to_idx:
+                    title_to_idx[norm_k] = int(v)
+            except Exception:
+                continue
         return title_to_idx
-    except Exception:
-        # last resort: if it's a list-like etc.
-        raise RuntimeError(
-            "indices.pkl must be dict or pandas Series-like (with .items())"
-        )
+    except Exception as e:
+        print(f"Warning in build_title_to_idx_map: {e}")
+        return title_to_idx
 
 
 def get_local_idx_by_title(title: str) -> int:
     global TITLE_TO_IDX
+    ensure_pickles_loaded()
     if TITLE_TO_IDX is None:
-        raise HTTPException(status_code=500, detail="TF-IDF index map not initialized")
+        raise HTTPException(
+            status_code=503, detail="TF-IDF index map is not loaded"
+        )
     key = _norm_title(title)
     if key in TITLE_TO_IDX:
         return int(TITLE_TO_IDX[key])
@@ -229,8 +248,11 @@ def tfidf_recommend_titles(
     Safe against missing columns/rows.
     """
     global df, tfidf_matrix
+    ensure_pickles_loaded()
     if df is None or tfidf_matrix is None:
-        raise HTTPException(status_code=500, detail="TF-IDF resources not loaded")
+        raise HTTPException(
+            status_code=503, detail="TF-IDF model resources are not loaded"
+        )
 
     idx = get_local_idx_by_title(query_title)
 
@@ -278,32 +300,42 @@ async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
 # =========================
 # STARTUP: LOAD PICKLES
 # =========================
-@app.on_event("startup")
 def load_pickles():
     global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
 
-    # Load df
-    with open(DF_PATH, "rb") as f:
-        df = pickle.load(f)
+    if os.path.exists(DF_PATH):
+        with open(DF_PATH, "rb") as f:
+            df = pickle.load(f)
 
-    # Load indices
-    with open(INDICES_PATH, "rb") as f:
-        indices_obj = pickle.load(f)
+    if os.path.exists(INDICES_PATH):
+        with open(INDICES_PATH, "rb") as f:
+            indices_obj = pickle.load(f)
 
-    # Load TF-IDF matrix (usually scipy sparse)
-    with open(TFIDF_MATRIX_PATH, "rb") as f:
-        tfidf_matrix = pickle.load(f)
+    if os.path.exists(TFIDF_MATRIX_PATH):
+        with open(TFIDF_MATRIX_PATH, "rb") as f:
+            tfidf_matrix = pickle.load(f)
 
-    # Load tfidf vectorizer (optional, not used directly here)
-    with open(TFIDF_PATH, "rb") as f:
-        tfidf_obj = pickle.load(f)
+    if os.path.exists(TFIDF_PATH):
+        with open(TFIDF_PATH, "rb") as f:
+            tfidf_obj = pickle.load(f)
 
-    # Build normalized map
-    TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
+    if indices_obj is not None:
+        TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
 
-    # sanity
-    if df is None or "title" not in df.columns:
-        raise RuntimeError("df.pkl must contain a DataFrame with a 'title' column")
+
+@app.on_event("startup")
+def startup_event():
+    ensure_pickles_loaded()
+
+
+# =========================
+# STATIC FILES & FRONTEND
+# =========================
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+INDEX_PATH = os.path.join(STATIC_DIR, "index.html")
+
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # =========================
@@ -314,8 +346,27 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/")
-def root():
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    if os.path.exists(INDEX_PATH):
+        with open(INDEX_PATH, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(
+        """
+        <html>
+            <head><title>Movie Recommender</title></head>
+            <body style="font-family:sans-serif;padding:2rem;background:#090d16;color:#fff;">
+                <h1>🎬 Movie Recommender API</h1>
+                <p>Status: <strong>Running</strong></p>
+                <p><a style="color:#6366f1;" href="/docs">View Swagger API Documentation</a></p>
+            </body>
+        </html>
+        """
+    )
+
+
+@app.get("/api/info")
+def api_info():
     return {
         "name": app.title,
         "status": "ok",
@@ -331,7 +382,7 @@ async def home(
     limit: int = Query(24, ge=1, le=50),
 ):
     """
-    Home feed for Streamlit (posters).
+    Home feed endpoint (posters and movie cards).
     category:
       - trending (trending/movie/day)
       - popular, top_rated, upcoming, now_playing  (movie/{category})
@@ -361,9 +412,7 @@ async def tmdb_search(
 ):
     """
     Returns RAW TMDB shape with 'results' list.
-    Streamlit will use it for:
-      - dropdown suggestions
-      - grid results
+    Used for dropdown suggestions and grid results.
     """
     return await tmdb_search_movies(query=query, page=page)
 
@@ -482,3 +531,11 @@ async def search_bundle(
         tfidf_recommendations=tfidf_items,
         genre_recommendations=genre_recs,
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", 8000))
+    print(f"🎬 Starting Movie Recommender app at http://localhost:{port}")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
